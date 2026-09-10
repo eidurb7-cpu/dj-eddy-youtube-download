@@ -116,7 +116,14 @@ class Handler(BaseHTTPRequestHandler):
                         del JOBS[key]
                 key = uuid.uuid4().hex
                 JOBS[key] = {'status': 'starting', 'message': 'Finding the best audio source…', 'progress': None, 'created': time.time()}
-            threading.Thread(target=convert, args=(key, url, fmt), daemon=True).start()
+            if ON_VERCEL:
+                # Keep the invocation alive: detached threads can be suspended
+                # as soon as the HTTP response is returned.
+                convert(key, url, fmt)
+                if JOBS[key]['status'] == 'error':
+                    return self.send_json({'error': JOBS[key]['message']}, 502)
+            else:
+                threading.Thread(target=convert, args=(key, url, fmt), daemon=True).start()
             self.send_json({'id': key}, 202)
         except (ValueError, TypeError, AttributeError) as exc:
             self.send_json({'error': str(exc)}, 400)

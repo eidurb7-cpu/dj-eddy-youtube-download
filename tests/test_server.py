@@ -1,4 +1,4 @@
-import errno, importlib.util, os, sys, tempfile, unittest, uuid, wave
+import errno, importlib.util, io, json, os, sys, tempfile, unittest, uuid, wave
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
@@ -16,6 +16,26 @@ class FakeYoutubeDL:
         return info
 
 class ConversionTests(unittest.TestCase):
+    def test_vercel_conversion_finishes_before_response(self):
+        request = object.__new__(server.Handler)
+        body = json.dumps({'url': 'https://youtu.be/aqz-KE-bpKQ', 'format': 'original'}).encode()
+        request.path = '/api/convert'
+        request.headers = {'Host': 'dj-eddy-youtube-download.vercel.app', 'Origin': 'https://dj-eddy-youtube-download.vercel.app', 'Content-Length': str(len(body))}
+        request.rfile = io.BytesIO(body)
+        events = []
+        def convert(key, url, fmt):
+            events.append('convert')
+            server.JOBS[key].update(status='error', message='Extractor unavailable')
+        def respond(data, status=200):
+            events.append('respond')
+            self.assertEqual(status, 502)
+            self.assertEqual(data, {'error': 'Extractor unavailable'})
+        request.send_json = respond
+        with patch.object(server, 'ON_VERCEL', True), patch.object(server, 'JOBS', {}), patch.object(server, 'convert', convert), patch('threading.Thread') as thread:
+            request.do_POST()
+            thread.assert_not_called()
+        self.assertEqual(events, ['convert', 'respond'])
+
     def test_vercel_import_with_read_only_project(self):
         spec = importlib.util.spec_from_file_location('vercel_test_server', server.__file__)
         module = importlib.util.module_from_spec(spec)
