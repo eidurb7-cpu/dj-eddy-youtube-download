@@ -1,4 +1,4 @@
-import sys, tempfile, unittest, uuid, wave
+import errno, importlib.util, os, sys, tempfile, unittest, uuid, wave
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
@@ -16,6 +16,36 @@ class FakeYoutubeDL:
         return info
 
 class ConversionTests(unittest.TestCase):
+    def test_vercel_import_with_read_only_project(self):
+        spec = importlib.util.spec_from_file_location('vercel_test_server', server.__file__)
+        module = importlib.util.module_from_spec(spec)
+        mkdir = Path.mkdir
+        def guarded_mkdir(path, *args, **kwargs):
+            if path.is_relative_to(server.ROOT):
+                raise OSError(errno.EROFS, 'Read-only file system', str(path))
+            return mkdir(path, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as scratch:
+            with patch.dict(os.environ, {'VERCEL': '1', 'VERCEL_URL': 'preview.vercel.app'}), patch('tempfile.gettempdir', return_value=scratch), patch.object(Path, 'mkdir', guarded_mkdir):
+                spec.loader.exec_module(module)
+            self.assertEqual(module.DOWNLOADS, Path(scratch) / 'dj-eddy-downloads')
+            self.assertTrue(module.DOWNLOADS.is_dir())
+            self.assertIs(module.handler, module.Handler)
+            with patch.dict(os.environ, {'VERCEL_URL': 'preview.vercel.app'}):
+                self.assertIn('preview.vercel.app', module.allowed_hosts())
+                self.assertIn('dj-eddy-youtube-download.vercel.app', module.allowed_hosts())
+                self.assertNotIn('evil.com', module.allowed_hosts())
+
+    def test_storage_failure_marks_job_failed(self):
+        key = uuid.uuid4().hex
+        server.JOBS[key] = {'status': 'starting'}
+        try:
+            with patch.object(Path, 'mkdir', side_effect=OSError('No space left on device')):
+                server.convert(key, 'https://youtu.be/aqz-KE-bpKQ', 'mp3')
+            self.assertEqual(server.JOBS[key]['status'], 'error')
+            self.assertIn('No space', server.JOBS[key]['message'])
+        finally:
+            server.JOBS.pop(key)
+
     def test_url_validation(self):
         self.assertEqual(server.canonical_url('https://youtu.be/aqz-KE-bpKQ?t=1'),'https://www.youtube.com/watch?v=aqz-KE-bpKQ')
         for value in ['https://evil.com/watch?v=aqz-KE-bpKQ','file:///etc/passwd','https://youtube.com/playlist?list=bad','https://youtu.be/bad']:

@@ -1,15 +1,23 @@
 """Local-only YouTube audio studio. Run with .venv/bin/python server.py."""
-import json, os, re, shutil, subprocess, sys, threading, time, uuid
+import json, os, re, shutil, subprocess, sys, tempfile, threading, time, uuid
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote
 
 ROOT = Path(__file__).parent.resolve()
-DOWNLOADS = ROOT / '.downloads'
-DOWNLOADS.mkdir(exist_ok=True)
+ON_VERCEL = os.environ.get('VERCEL') == '1'
+DOWNLOADS = (Path(tempfile.gettempdir()) / 'dj-eddy-downloads') if ON_VERCEL else ROOT / '.downloads'
+DOWNLOADS.mkdir(parents=True, exist_ok=True)
 JOBS = {}
 LOCK = threading.Lock()
 PORT = int(os.environ.get('PORT', '8765'))
+
+def allowed_hosts():
+    hosts = {f'localhost:{PORT}', f'127.0.0.1:{PORT}'}
+    if ON_VERCEL:
+        hosts.add('dj-eddy-youtube-download.vercel.app')
+        hosts.update(os.environ[key] for key in ('VERCEL_URL', 'VERCEL_PROJECT_PRODUCTION_URL', 'VERCEL_BRANCH_URL') if os.environ.get(key))
+    return hosts
 
 def canonical_url(value):
     p = urlparse(value.strip())
@@ -27,11 +35,8 @@ def canonical_url(value):
     return 'https://www.youtube.com/watch?v=' + video
 
 def convert(job_id, url, fmt):
-    import yt_dlp
-    import imageio_ffmpeg
     job = JOBS[job_id]
     folder = DOWNLOADS / job_id
-    folder.mkdir()
     def progress(d):
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate')
@@ -39,6 +44,9 @@ def convert(job_id, url, fmt):
         elif d['status'] == 'finished':
             job.update(status='processing', message='Preparing your audio file…', progress=96)
     try:
+        import yt_dlp
+        import imageio_ffmpeg
+        folder.mkdir()
         opts = {'js_runtimes': {'node': {}}, 'format': 'bestaudio', 'noplaylist': True, 'outtmpl': str(folder / 'source.%(ext)s'), 'quiet': True, 'no_warnings': True, 'socket_timeout': 25, 'retries': 2, 'progress_hooks': [progress], 'max_filesize': 500 * 1024 * 1024}
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -80,10 +88,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
     def do_POST(self):
-        if self.headers.get('Host') not in (f'localhost:{PORT}', f'127.0.0.1:{PORT}'):
+        if self.headers.get('Host') not in allowed_hosts():
             return self.send_json({'error': 'Invalid host.'}, 403)
         origin = self.headers.get('Origin')
-        if origin and origin not in (f'http://localhost:{PORT}', f'http://127.0.0.1:{PORT}'):
+        allowed_origins = {f'http://localhost:{PORT}', f'http://127.0.0.1:{PORT}'}
+        if ON_VERCEL:
+            allowed_origins.update('https://' + host for host in allowed_hosts() if host not in (f'localhost:{PORT}', f'127.0.0.1:{PORT}'))
+        if origin and origin not in allowed_origins:
             return self.send_json({'error': 'Invalid origin.'}, 403)
         if self.path != '/api/convert':
             return self.send_json({'error': 'Not found.'}, 404)
@@ -137,6 +148,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options','nosniff')
         self.end_headers()
         self.wfile.write(raw)
+
+# Vercel's Python runtime looks for this lowercase export.
+handler = Handler
 
 if __name__ == '__main__':
     for stale in DOWNLOADS.iterdir():
